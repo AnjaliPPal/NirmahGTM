@@ -1,0 +1,199 @@
+# Changelog
+
+All notable changes to SignalOS are documented here.
+Format: [keepachangelog.com](https://keepachangelog.com/en/1.0.0/), semantic versioning.
+
+## [Unreleased]
+
+- Phase D: Public endpoint (ngrok) + Clay Custom HTTP demo table + SignalOS Loom
+- Phase B: Multi-LLM cost breakdown — wire per-call costs from pre-filter, scoring, and opener into `model_costs` field on every run
+
+---
+
+## [2.6.0] - 2026-06-02
+
+### Added
+- `mcp_server.py` — FastMCP server exposes 3 tools to Claude Desktop: `score_company_tool` (full pipeline score), `get_hot_leads` (fetch ready accounts from Supabase), `get_pitch` (retrieve cached pitch block without re-running pipeline).
+- `scorer/rag.py` (Phase C) — pgvector RAG layer. OpenAI `text-embedding-3-small` embeds each scored company into Supabase `signals.embedding` column. `retrieve_similar()` calls `match_signals()` SQL RPC for cosine top-5 similar past accounts. `format_rag_context()` injects retrieved context into scoring prompt. Degrades gracefully when `OPENAI_API_KEY` not set.
+- `scorer/agent.py` (Phase B) — LangGraph fan-out batch agent scores up to 50 companies in parallel. Sequential fallback when LangGraph not installed. `run_batch()` ranks by score, calls Groq `llama-3.3-70b-versatile` for VP-of-Sales executive brief.
+- `POST /batch-score` — HTTP endpoint wrapping `run_batch()` via `asyncio.to_thread`. Returns `BatchScoreResult` with ranked leads and summary.
+- `POST /webhook/hubspot-reply` — records deal outcome (replied/closed/no_reply/bounced) in `eval_outcomes` table. Powers reply-rate accuracy reporting. Auth: `WEBHOOK_SECRET` env var required (fail-closed).
+- `GET /eval-report/{client_id}` — returns reply/close rates grouped by `prompt_version`. Proves prompt improvement over time.
+- `GET /admin/failed-inserts` — returns Supabase write failures buffered to local JSONL. Auth: `ADMIN_API_KEY` env var required (fail-closed).
+- 5 new migration files (`db/migrations/001-005`, `supabase/migrations/`) for pgvector column, eval_outcomes table, and multi-LLM routing tables.
+- `scripts/migrate.py` — one-command migration runner.
+- 27 new pytest tests (90 → 117): test_mcp.py, test_rag.py, test_router.py, test_agent.py, test_research_target.py, test_eval.py, plus unit tests for `_estimate_acv`, `_contact_window_from_date`, new API endpoints.
+
+### Fixed (Security)
+- `api/main.py` — webhook and admin auth now **fail-closed**: when `WEBHOOK_SECRET`/`ADMIN_API_KEY` env vars are unset, all requests are rejected (previously skipped auth silently).
+- `scorer/scorer.py` — `scoring_context` (caller-supplied) wrapped in `<clay_context>` delimiters to prevent prompt injection.
+- `scorer/scorer.py` — LLM-returned contact indices clamped with `max(0, min(int(idx), n-1))` before array access; prevents `IndexError` on hallucinated values.
+- `api/main.py` — `/batch-score` enforces max 50 companies; rejects oversized requests with HTTP 400.
+- `scorer/rag.py`, `scorer/router.py` — silent `except: pass` blocks replaced with `logger.warning()` so Supabase/Groq failures surface in logs.
+
+**Tests: 117/117**
+
+---
+
+## [2.5.0] - 2026-05-31
+
+### Added
+- `scorer/research_target.py` — auto-detects a target company's confirmed customers from three free sources: Firecrawl homepage scrape, customer/case-study sub-pages (6 URL patterns), Google News RSS. Deduplicates by company name (case-insensitive). Graceful fallback if any source fails.
+- `tests/test_research_target.py` — 20 tests covering all three sources, deduplication, and graceful degradation. All mocked (no live calls).
+- `scorer/router.py` — `groq_json_extract(prompt, max_tokens)` public function. Calls `llama-3.1-8b-instant`, strips markdown fences, parses JSON. Returns `[]` on any failure.
+
+### Changed
+- `skills/brand-ai-outbound/run.py` — Phase 0 added: auto-detects brand.ai customers before ICP confirmation. ICP scoring context now built dynamically from discovered customers. Top output expanded from 10 → 20 companies (`brand-ai-top20.md`).
+
+**Tests: 90/90**
+
+---
+
+## [2.4.0] - 2026-05-30
+
+### Added
+- `skills/brand-ai-outbound/run.py` — 5-phase executable workflow for brand.ai GTM Engineer application. Phase 1: ICP confirmation from real customers. Phase 2: prospects CSV ingestion. Phase 3: brand hiring check (CMO/Head of Brand/Brand Designer via 3-tier ATS). Phase 4: batch scoring via `/batch-score`. Phase 5: writes 4 output files (top20.md, loom-script.md, application-email.md, short-answers.md).
+- `skills/brand-ai-outbound/CLAUDE.md` — skill documentation.
+
+### Fixed
+- `scorer/agent.py` — `_generate_summary()` used Anthropic SDK syntax (`messages.create`, `content[0].text`) but client is Groq. Fixed to `chat.completions.create()` + `choices[0].message.content`.
+
+---
+
+## [2.3.0] - 2026-05-24
+
+### Added
+- `talking_points: list[str]` on `ScoreResult` — 3–5 BDR cold-call hooks for high-score leads. Each hook names a specific fact and the internal tension it creates. Generated by `llama-3.1-8b-instant`. Empty list for low-score leads.
+- `situation: Optional[str]` on `ScoreResult` — one paragraph combining all 5 signals into analyst prose. Facts extracted in Python (no hallucination risk), woven by LLM. Falls back to pipe-joined fact list if LLM call fails.
+
+### Changed
+- `scorer/prompts.py` `OPENER_PROMPT_V1` — rewritten to DATA→ASSUMPTION→CTA framework. Bad/good in-context examples embedded. Forbidden phrases (leverage, synergy, pain points, streamline). Forbidden openings (I, Hi, Hey, Congrats, Hope). Message cap 45 words (was 20).
+- `CACHE_DAYS` default: 14 → 28. Validated 4-week cooling rule — re-scoring within 14 days wastes tokens and burns credibility with clients.
+- `CLAUDE.md` — full rewrite to match actual Groq/llama stack. Was showing stale Anthropic SDK references.
+
+---
+
+## [2.2.0] - 2026-05-23
+
+### Added
+- `scorer/signal_detector.py` — 3-tier ATS hiring detection. Tier 0: regex-match embed code from careers page HTML to extract exact ATS slug (Greenhouse/Lever/Ashby). Tier 1: slug guessing (2 variants). Tier 2: Google News fallback. Hiring hit rate: ~40% → ~70–75%.
+- `_contact_window_from_date()` in `scorer/scorer.py` — deterministic contact window from leadership hire date (RFC 2822 parsed, days computed in Python). Overrides LLM guess when `leadership_hire_date` exists.
+- `_estimate_acv()` in `scorer/scorer.py` — lookup-table ACV by headcount + funding stage. Replaces flat $45K default for all companies.
+- CRM stack gap detection in opener evidence — detects CRM-without-engagement-tool (e.g. HubSpot + no Outreach) and flags it as the sharpest opener angle.
+- Multi-contact ranking — when Hunter returns >1 contact, `llama-3.1-8b-instant` picks the most relevant contact for the top signal. `secondary_contact` field on `ScoreResult`.
+
+### Fixed
+- VC firm false-positive guard in funding detection — rejects titles matching `{company} (capital|ventures|partners|fund|vc)` to prevent VC firm announcements triggering target company.
+- `aha_moment` grounded in real headline — when `funded_90d_headline` exists, `aha_moment` is built in Python from actual RSS data. LLM never formats funding details.
+- Lever API title field — Lever uses `"text"` not `"title"`. Was silently returning 0 GTM jobs.
+- Removed incorrect BambooHR API endpoint (BambooHR has no public API).
+- `api/main.py` — domain validation changed from sync `httpx.head()` (blocks event loop) to `async with httpx.AsyncClient()`.
+- CORS: `allow_origins=["*"]` → reads from `CORS_ORIGINS` env var. Methods restricted to `GET, POST`.
+- `@field_validator("domain")` on `CompanyInput` — strips `https://`, `www.`, trailing slash at model boundary.
+- `scorer/enrichment.py` — Firecrawl now tries when org data is missing (employee_count OR industry), not only when both name AND employee_count are absent. Results merged, not replaced.
+- Structured logging throughout — replaced all `print()` and bare `except: pass` with `logging.getLogger(__name__)`.
+- `GROQ_API_KEY` missing — changed `os.environ["GROQ_API_KEY"]` (KeyError) to `os.environ.get()` with clear `ValueError`.
+- Supabase backup cascade — double-failure now emits `CRITICAL` log instead of silent pass.
+
+**Tests: 63**
+
+---
+
+## [2.1.0] - 2026-05-22
+
+### Added
+- `scorer/agent.py` — LangGraph fan-out batch agent. `run_batch(companies, min_score)` fans out to parallel `score_one` nodes, collects results, ranks by score descending, calls Groq for VP-of-Sales executive brief. Sequential fallback when LangGraph not installed.
+- `mcp_server.py` — FastMCP server exposing 3 tools to Claude Desktop: `score_company_tool`, `get_hot_leads`, `get_pitch`.
+- `api/main.py` — `POST /batch-score` (wraps `run_batch`), `GET /admin/failed-inserts` endpoints.
+- `scorer/models.py` — `EvalOutcome`, `EvalReport`, `BatchScoreRequest`, `BatchScoreResult`, `db_persisted` field.
+- `db/schema.sql` — `eval_outcomes` table with `prompt_version`, `score`, `confidence`, `outcome` enum (`replied/closed/no_reply/bounced`), `days_to_outcome`. Indexes on `(prompt_version, outcome)` and `(score, outcome)`.
+- `api/main.py` — `POST /webhook/hubspot-reply` (records outcome from HubSpot workflow), `GET /eval-report/{client_id}` (reply rate + close rate per prompt version).
+- `scorer/scorer.py` — Langfuse tracing via lazy `_get_langfuse()`. Wraps each scoring call with `trace.generation()` logging model, tokens, score, confidence, prompt_version. Graceful degradation — no-ops when env vars not set.
+- `demo/app.py` — Gradio UI. Score badge, contact window, top signal, aha moment, opener, reasoning, cost, full JSON accordion. 3 example companies pre-loaded.
+
+### Changed
+- `db/schema.sql` — complete rewrite to canonical single source of truth. Added `company_id` (uuid UNIQUE), `pitch_block`, `signal_scores`, `auto_detected` columns missing from previous schema.
+- Added `db/migrations/001_initial_schema.sql`, `002_v2_phase1_phase2.sql`, `003_v2_phase3_evals.sql` for upgrade path.
+- Failed Supabase inserts now written to `failed_inserts.jsonl` as backup. `db_persisted: bool` returned on `ScoreResult` so callers know if data was saved.
+
+**Tests: 37/37**
+
+---
+
+## [2.0.0] - 2026-05-21
+
+### Added
+- Evidence strings on all 5 signals — `leadership_change_evidence`, `hiring_gtm_evidence`, `tech_stack_evidence`, `funded_90d_evidence`, `hidden_intent_evidence` on `Signals` model. `signal_detector.py` populates raw text (actual RSS headlines, Greenhouse JD snippets). Scoring and opener prompts receive evidence, not just booleans.
+- `PROMPT_VERSION` constant in `scorer/prompts.py`. Stored on every `ScoreResult` and in Supabase. Enables SQL queries like "prompt v2.0 had 12% false positives, v2.1 dropped to 4%".
+- Calibration examples in `SCORING_SYSTEM_PROMPT` — 3 anchor examples (scores 9/5/2). Locks scoring scale across runs; same company no longer gets different scores on different calls.
+- Confidence band definitions in `SCORING_SYSTEM_PROMPT` — 50–65: sparse/ambiguous data; 66–79: some gaps; 80–100: strong evidence on all 5 triggers.
+- 45-day cooldown suppression in `api/main.py` — queries Supabase before scoring. Domain alerted in last 45 days → returns `suppressed=True`, skips Groq/Slack/HubSpot. Prevents n8n from double-alerting accounts.
+- Domain validation in `api/main.py` — async `httpx` HEAD request before enrichment. DNS fail or HTTP ≥ 400 → returns error immediately without consuming tokens.
+
+### Removed
+- `scorer/scraper.py` and `scorer/session_manager.py` — LinkedIn ghost account scraper permanently deleted. ToS violation, breaks quarterly when LinkedIn rotates bot detection, indefensible in technical interviews.
+
+### Changed
+- `scorer/enrichment.py` — Firecrawl self-hosted Docker (`FIRECRAWL_API_URL`, default `http://localhost:3002`) replaces LinkedIn scraper as waterfall Tier 3. Unlimited, $0, ToS-compliant.
+- `api/main.py` `/health` — now pings Supabase and returns `"db": "ok"` or `"db": "error: <message>"`.
+- `scorer/prompts.py` `OPENER_PROMPT_V1` — receives `evidence_block` (raw signal evidence) instead of `{reasoning}` (Claude-generated summary). Openers grounded in real data.
+
+**Tests: 29/29**
+
+---
+
+## [1.5.0] - 2026-05-16
+
+### Added
+- `scorer/crm.py` — HubSpot private app integration: upsert contact (with 409 → search fallback), create deal with signal name, associate contact ↔ deal.
+- `api/main.py` — `POST /push-to-crm` endpoint for manually pushing quarantined leads after human review approval.
+- `scorer/models.py` — `CRMResult` model. `pushed_to_crm`, `hubspot_contact_id`, `hubspot_deal_id` on `ScoreResult`.
+- `tests/test_crm.py` — 6 tests: no-token guard, success, 409 upsert fallback, no-email path, API error non-fatal, deal name includes signal.
+
+### Changed
+- `scorer/slack.py` — "Push to HubSpot" button links to the actual deal when auto-pushed. Label changes to "View in HubSpot".
+- High-confidence leads auto-pushed to HubSpot immediately after Slack alert. Zero manual steps for SDR on confirmed signals.
+
+---
+
+## [1.4.0] - 2026-05-15
+
+### Added
+- `scorer/signal_detector.py` — auto-detects all 5 GTM triggers from free public sources. `signals` field on `CompanyInput` is now optional; omit it and SignalOS detects everything from domain alone.
+  - Leadership changes → Google News RSS
+  - Hiring signals → Greenhouse / Lever / Ashby public APIs
+  - Tech stack → website homepage HTML scan
+  - Funding & M&A → Google News RSS
+  - Hidden intent → Google News RSS (expansion/scaling keywords)
+
+---
+
+## [1.3.0] - 2026-05-15
+
+### Added
+- Confidence score (50–100) returned alongside score. Governance routing: `confidence < CONFIDENCE_THRESHOLD` → Slack `#human-review-required` instead of main sales channel.
+- ROI receipt in Slack Block Kit: pipeline value, signal cost, ROI ratio, HubSpot button.
+- 14-day Supabase cache — repeat domains return cached result without LLM call.
+- `api/main.py` — `/review-queue` endpoint for retrieving quarantined leads.
+
+---
+
+## [1.2.0] - 2026-05-15
+
+### Added
+- `aha_moment: Optional[str]` on `ScoreResult` — 1–2 sentences on signals + buying urgency, displayed at the top of the Slack alert. Replaces generic "Why now: Funding + GTM hiring" line.
+
+---
+
+## [1.1.0] - 2026-05-15
+
+### Added
+- `scorer/enrichment.py` — Hunter.io (50 lookups/month free) + Apollo (50 org credits/month free) enrichment waterfall. Adds decision maker name, title, email to `ScoreResult`.
+- Prompt caching in `scorer/scorer.py` — system prompt cached. ~80% cost reduction on repeat calls.
+- Slack alerts include decision maker email so SDR can act without a research tab.
+
+### Initial stack
+- FastAPI + uvicorn, Python 3.11, Pydantic v2
+- Groq: `llama-3.3-70b-versatile` (scoring), `llama-3.1-8b-instant` (opener, situation, talking points, contact ranking)
+- OpenAI: `gpt-4o-mini` (pre-filter, optional), `text-embedding-3-small` (RAG embeddings, optional)
+- Supabase (Postgres + pgvector), HubSpot, Slack Incoming Webhooks, n8n

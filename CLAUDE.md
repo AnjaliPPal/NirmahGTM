@@ -1,30 +1,68 @@
 # SignalOS — CLAUDE.md
+# Last updated: May 30, 2026
+# Rule: update this file every time the architecture, LLM stack, or test count changes.
 
 ## What This Project Is
 
 SignalOS is a **production AI reasoning engine** for B2B GTM teams.
 It does not replace Clay — it sits **inside Clay** as a Custom HTTP column and adds the reasoning layer Clay cannot provide natively.
 
-**Stack:** FastAPI + Python + Claude API (claude-sonnet-4-6) + Supabase + Slack + HubSpot + n8n
-
 **Positioning for hiring managers:** This demonstrates what a Forward Deployed Engineer / AI Engineer does in production — real customers, real integrations, evals, agent orchestration, MCP tooling.
+
+**Stack (actual, verified May 30 2026):**
+- FastAPI + Python 3.11
+- Groq API — llama-3.3-70b-versatile (scoring), llama-3.1-8b-instant (opener, situation, talking points, contact ranking, batch summary)
+- OpenAI text-embedding-3-small (RAG embeddings — optional, degrades gracefully if key not set)
+- GPT-4o-mini (pre-filter — optional, falls back to rule-based if OPENAI_API_KEY not set)
+- Supabase (Postgres + pgvector) + Langfuse (tracing, optional) + HubSpot + Slack
 
 ---
 
-## Architecture
+## Architecture (current, verified against code)
 
 ```
 Clay table row → POST /score-company
                         │
-                        ├─ Auto-detects signals (Google News RSS, Greenhouse/Lever, website scan)
-                        ├─ RAG: retrieves 5 nearest past scored companies + their outcomes
-                        ├─ Claude Sonnet reasons over signals + RAG context
-                        ├─ Returns: score 1-10, aha_moment, top_signal, contact_window, pitch_block
+                        ├─ Domain validation (httpx.AsyncClient HEAD — returns error if unreachable)
+                        ├─ Cache check (28-day Supabase lookup — returns cached result if hit)
+                        ├─ Cooldown check (45-day suppression — returns suppressed=True if alerted recently)
                         │
-                        ├─ score ≥ 6 + confidence ≥ 0.7 → HubSpot CRM push + Slack alert
-                        ├─ confidence < 0.7 → quarantine to #human-review-required
-                        └─ All results → Supabase (analytics + RAG source)
+                        ├─ Auto-detect 5 signals (signal_detector.py — Google News RSS, Greenhouse/Lever/Ashby ATS API, homepage HTML)
+                        ├─ Enrich company (enrichment.py — Hunter → Apollo → Firecrawl waterfall)
+                        ├─ Pre-filter (router.py — GPT-4o-mini or rule-based fallback)
+                        ├─ RAG retrieval (rag.py — pgvector cosine similarity, top-5 similar past accounts)
+                        │
+                        ├─ Groq llama-3.3-70b-versatile scores: score 1-10, confidence, reasoning,
+                        │   top_signal, contact_window, aha_moment, signal_scores, pitch_block
+                        │
+                        ├─ Contact ranking (llama-3.1-8b-instant — picks most relevant contact for top signal)
+                        ├─ Email opener (llama-3.1-8b-instant via generate_opener_gemini() — DATA→ASSUMPTION→CTA)
+                        ├─ Situation paragraph (llama-3.1-8b-instant — combines all 5 signals into analyst prose)
+                        ├─ Talking points (llama-3.1-8b-instant — 3-5 BDR cold-call hooks)
+                        │
+                        ├─ score ≥ 6 + confidence ≥ 80 → HubSpot CRM push + Slack Block Kit alert (main channel)
+                        ├─ score ≥ 6 + confidence < 80 → Slack #human-review-required (quarantine)
+                        ├─ Store embedding in pgvector (for future RAG retrieval)
+                        └─ All results → Supabase signals table (analytics + RAG source)
 ```
+
+**Batch path:** `POST /batch-score` → `scorer/agent.py` LangGraph fan-out → parallel `score_company` per company → rank → Groq llama-3.3-70b executive brief.
+
+---
+
+## LLM Routing (actual — verified against router.py and scorer.py)
+
+| Task | Model | Client | Cost |
+|------|-------|--------|------|
+| Pre-filter (has signals worth scoring?) | gpt-4o-mini | OpenAI (optional) | ~$0.0001/call |
+| Pre-filter fallback (no OPENAI_API_KEY) | rule-based | None | $0 |
+| Scoring | llama-3.3-70b-versatile | Groq | Free tier |
+| Opener / Situation / Talking points / Contact ranking / Batch summary | llama-3.1-8b-instant | Groq | Free tier |
+| RAG embeddings | text-embedding-3-small | OpenAI (optional) | ~$0.00002/call |
+
+**Note on naming:** `router.py` exports `GEMINI_OPENER_MODEL = "llama-3.1-8b-instant"` — the variable is named "Gemini" but actually runs Groq. Historical naming artefact. Do not change without updating scorer.py imports.
+
+**Note on /health:** The `/health` endpoint returns `"model": "claude-sonnet-4-6"` — this string is stale (leftover from v1). Actual scoring model is Groq llama-3.3-70b-versatile. Fix: update `api/main.py` line 158.
 
 ---
 
@@ -32,15 +70,40 @@ Clay table row → POST /score-company
 
 | File | Purpose |
 |------|---------|
-| `scorer/scorer.py` | Core scoring logic — Claude prompt, RAG retrieval, CRM gating |
-| `scorer/models.py` | All Pydantic models: Signals, ScoreResult, CRMResult |
-| `scorer/signal_detector.py` | Auto-detects 5 GTM triggers from free public sources |
+| `scorer/scorer.py` | Core scoring logic — Groq calls, RAG injection, opener, situation, talking points, CRM gating |
+| `scorer/models.py` | All Pydantic models: Signals, CompanyInput, ScoreResult, CRMResult, Batch*, Eval* |
+| `scorer/agent.py` | LangGraph fan-out batch agent — scores up to 50 companies in parallel |
+| `scorer/signal_detector.py` | Auto-detects 5 GTM triggers from free public sources (Google News RSS, ATS APIs, HTML scan) |
+| `scorer/research_target.py` | Auto-detect a target company's confirmed customers (homepage + /customers page + Google News). Used by outbound skills to seed ICP lookalike lists without hardcoding. |
+| `scorer/enrichment.py` | Waterfall enrichment: Hunter → Apollo → Firecrawl |
+| `scorer/router.py` | Pre-filter (GPT-4o-mini or rule-based), opener generation (llama-3.1-8b-instant via Groq) |
+| `scorer/rag.py` | pgvector embeddings via OpenAI, retrieves 5 similar past scored companies |
+| `scorer/prompts.py` | All LLM prompts (SCORING_SYSTEM_PROMPT, SCORING_PROMPT_V2, OPENER_PROMPT_V1) — versioned, never inline |
 | `scorer/crm.py` | HubSpot: upsert contact (409 fallback), create deal, associate |
-| `scorer/slack.py` | Slack alert with ROI receipt, HubSpot deep link |
-| `scorer/prompts.py` | All Claude prompts — keep prompt changes logged in roadmap |
-| `api/main.py` | FastAPI routes: POST /score-company, GET /health, POST /push-to-crm |
-| `db/schema.sql` | Supabase schema — run once in SQL editor |
-| `n8n/signalos_workflow.json` | n8n automation workflow |
+| `scorer/slack.py` | Slack Block Kit ROI alert (main channel) + quarantine routing (#human-review-required) |
+| `mcp_server.py` | FastMCP server — 3 tools: score_company_tool / get_hot_leads / get_pitch |
+| `api/main.py` | FastAPI routes: /score-company, /batch-score, /health, /leads, /push-to-crm, /review-queue, /webhook/hubspot-reply, /eval-report, /admin/failed-inserts |
+| `api/deps.py` | Supabase client singleton |
+| `demo/app.py` | Gradio UI — type domain, get full score result. Run: `python demo/app.py` (port 7860) |
+| `db/schema.sql` | Canonical Supabase schema — must stay in sync with models.py |
+| `db/migrations/` | ALTER TABLE scripts for upgrading existing DBs |
+| `n8n/signalos_workflow.json` | Importable n8n workflow (scheduled scoring orchestration) |
+| `skills/brand-ai-outbound/run.py` | brand.ai application workflow — research → brand signal check → score → 4 output files |
+| `skills/brand-ai-outbound/CLAUDE.md` | Documentation for the brand-ai-outbound workflow |
+
+---
+
+## Signal Detection — What's Detected and How
+
+| Trigger | Source | Method |
+|---------|--------|--------|
+| 1. Leadership Changes | Google News RSS | Query for exec hires; returns name, title, hire date (RFC 2822) |
+| 2. Hiring Signals | Greenhouse / Lever / Ashby public APIs | Tier 0: ATS embed from careers page HTML. Tier 1: slug guessing. Tier 2: Google News |
+| 3. Tech Stack | Company homepage HTML | Scan for tool signatures (Salesforce, HubSpot, Outreach, etc.) |
+| 4. Funding & M&A | Google News RSS | VC-firm-modifier guard prevents false positives (e.g. "Notion Capital" ≠ Notion) |
+| 5. Hidden Intent | Google News RSS | Expansion/growth/scaling keywords before job posts appear |
+
+**Gap (documented):** `signal_detector._GTM_KEYWORDS` detects sales-role hiring (SDR, BDR, AE, RevOps). It does NOT detect brand/marketing hiring (Head of Brand, CMO, Brand Designer). The `skills/brand-ai-outbound/run.py` fills this gap for the brand.ai use case by adding a parallel brand-keyword ATS check.
 
 ---
 
@@ -51,7 +114,9 @@ Clay table row → POST /score-company
 - Every new function gets a test in `tests/`
 - Never raise from CRM/Slack — return error in result model, log, continue
 - Prompt changes: document old→new in GTMFinalroadmapv1.md under changelog
-- Free-tier only: Supabase free, Railway free, no paid APIs except Claude + OpenAI (as needed)
+- Free-tier only: Supabase free, Groq free tier, Gemini/OpenAI optional
+- All LLM calls use Groq client (`chat.completions.create`) — NOT Anthropic SDK pattern (`messages.create`)
+- `GEMINI_OPENER_MODEL` in router.py = llama-3.1-8b-instant on Groq — naming is historical, do not rename without updating imports
 - Multiple free accounts allowed (legal): Railway x4, Supabase x4, Vercel x4
 
 ---
@@ -59,43 +124,29 @@ Clay table row → POST /score-company
 ## Env Variables
 
 ```
-ANTHROPIC_API_KEY=          # Required — Claude API
-SLACK_WEBHOOK_URL=          # Optional — Slack alerts
-SUPABASE_URL=               # Optional — DB + RAG storage
-SUPABASE_KEY=               # Optional — DB key
-HUBSPOT_ACCESS_TOKEN=       # Optional — CRM push
-OPENAI_API_KEY=             # Optional — multi-LLM routing pre-filter
-GROQ_API_KEY=               # Optional — cheap cache hits
-SCORE_THRESHOLD=6           # Minimum score to trigger CRM push
-CONFIDENCE_THRESHOLD=0.7    # Below this → human review queue
+GROQ_API_KEY=                       # Required — Groq API (free tier, llama-3.3-70b-versatile)
+OPENAI_API_KEY=                     # Optional — pre-filter (gpt-4o-mini) + RAG embeddings (text-embedding-3-small)
+SLACK_WEBHOOK_URL=                  # Slack main sales channel
+SLACK_REVIEW_WEBHOOK_URL=           # Slack #human-review-required channel
+NEXT_PUBLIC_SUPABASE_URL=           # Supabase project URL
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY= # Supabase publishable key
+HUBSPOT_ACCESS_TOKEN=               # Optional — CRM push
+HUBSPOT_PORTAL_ID=                  # Optional — HubSpot portal ID
+SCORE_THRESHOLD=6                   # Minimum score to alert Slack
+CONFIDENCE_THRESHOLD=80             # Below this → quarantine to review queue
+CACHE_DAYS=28                       # Skip re-scoring same domain within N days (Ritu 4-week rule)
+DEAL_ACV=45000                      # Client ACV for ROI estimate in Slack alert
+WEBHOOK_SECRET=                     # Auth for POST /webhook/hubspot-reply
+ADMIN_API_KEY=                      # Auth for GET /admin/failed-inserts
+LANGFUSE_SECRET_KEY=                # Optional — LLM observability
+LANGFUSE_PUBLIC_KEY=                # Optional — LLM observability
+LANGFUSE_HOST=https://cloud.langfuse.com
+HUNTER_API_KEY=                     # Optional — email enrichment (50 credits/month free)
+APOLLO_API_KEY=                     # Optional — org enrichment (50 data credits/month free)
+FIRECRAWL_API_KEY=                     # Optional — Firecrawl cloud (free 500 credits/mo at firecrawl.dev). Takes priority over API_URL.
+FIRECRAWL_API_URL=http://localhost:3002 # Optional — self-hosted Firecrawl (Docker). Used only when API_KEY is not set.
+CORS_ORIGINS=                       # Comma-separated allowed origins (defaults to *)
 ```
-
----
-
-## v2.0 WOW Features (build order)
-
-1. **Pitch block** — domain-specific sales opener in ScoreResult (Phase 1, no deps)
-2. **RAG + pgvector** — embed past scored companies, retrieve outcomes as scoring context (Phase 2, needs Supabase pgvector enabled)
-3. **LLM Evals Dashboard** — log every Claude call, track score→reply_rate correlation (Phase 2)
-4. **LangGraph agent** — state-machine: detect → enrich → score → route → notify (Phase 3)
-5. **MCP server** — Model Context Protocol wrapping SignalOS tools for Claude Desktop (Phase 3)
-6. **Multi-LLM routing** — GPT-4o-mini pre-filter, Claude Sonnet for scoring, Groq for cache hits (Phase 3)
-7. **TypeScript client** — auto-generated from OpenAPI spec via openapi-typescript-codegen (Phase 4)
-8. **Next.js live demo** — Vercel free tier, hiring managers self-serve test (Phase 4)
-
----
-
-## Target Jobs (validated from real JDs in jobfrominternet.md)
-
-| Company | Role | Why This Project Hits It |
-|---------|------|--------------------------|
-| Anthropic | GTM Engineer / Solutions Architect | Evals dashboard, MCP server, Claude API production use |
-| Cohere | Forward Deployed Engineer | LangGraph, multi-LLM, customer-facing deployment |
-| Sierra | AI Engineer | Agent orchestration, CRM integration, real customer workflows |
-| Decagon | AI Engineer | Production AI system, Supabase, FastAPI, eval loops |
-| Glean | GTM Engineer | Clay integration, signal detection, pipeline automation |
-| Webflow | Solutions Engineer | TypeScript client, live demo, customer onboarding |
-| Harvey | Forward Deployed Engineer | Complex workflow automation, CRM push, reasoning traces |
 
 ---
 
@@ -106,21 +157,79 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-All 6 CRM tests pass. Run before every commit.
+90/90 tests passing as of May 31 2026. Run before every code change.
+
+Test files:
+- `tests/test_scorer.py` — core scoring logic, mock Groq calls
+- `tests/test_api.py` — FastAPI routes, async domain validation, cache/cooldown
+- `tests/test_signal_detector.py` — ATS detection (Greenhouse/Lever/Ashby/unknown), funding false-positive guard
+- `tests/test_enrichment.py` — Hunter/Apollo/Firecrawl waterfall
+- `tests/test_crm.py` — HubSpot upsert/409/no-email/error paths
+- `tests/test_router.py` — pre-filter (GPT-4o-mini + rule-based fallback), opener generation
+- `tests/test_rag.py` — embedding, storage, retrieval, format
+- `tests/test_agent.py` — LangGraph fan-out, ranking, suppressed exclusion, summary
+- `tests/test_eval.py` — webhook recording, eval report math
+- `tests/test_research_target.py` — customer extraction (clean/dedup/sources), graceful degradation
 
 ---
 
-## Deploy
+## Running Locally
 
 ```bash
-# Railway (free tier)
-railway login
-railway init
-railway up
-
-# Local
+# API server
+cd signalos-v1
 uvicorn api.main:app --reload --port 8000
+
+# Expose to Clay (for Custom HTTP column)
+ngrok http 8000
+
+# Gradio demo UI
+python demo/app.py
+
+# MCP server (for Claude Desktop)
+python mcp_server.py
+
+# brand.ai application workflow (needs prospects.csv first)
+python skills/brand-ai-outbound/run.py
 ```
+
+---
+
+## Application Layer — brand.ai (May 30 2026)
+
+`skills/brand-ai-outbound/` — job application workflow for brand.ai GTM Engineer role.
+
+**Architecture:**
+```
+Anjali runs Clay Ocean.io lookalike(lyft.com + turo.com + groq.com) → exports prospects.csv
+python skills/brand-ai-outbound/run.py
+  Phase 1: ICP confirmation (locked from 3 real brand.ai customers)
+  Phase 2: Ingest prospects.csv (company_name, domain only — no manual why_now)
+  Phase 3: Brand hiring check (Head of Brand, CMO, Brand Designer via ATS API — gap SignalOS doesn't cover)
+  Phase 4: POST → SignalOS /batch-score (auto-detects all 5 signals per company + brand_evidence in scoring_context)
+  Phase 5: Write 4 files → brand-ai-top10.md, loom-script.md, application-email.md, short-answers.md
+```
+
+**Why this skill exists:** SignalOS's signal_detector uses sales keywords (SDR, BDR, AE, RevOps). brand.ai's ICP signal is brand/marketing hiring (CMO, Head of Brand, Brand Designer). The skill adds brand-keyword ATS detection as a parallel check, then passes the result into scoring_context so the LLM weights it.
+
+**brand.ai real customers (verified May 30 2026 on brand.ai homepage):**
+- Lyft — Brian Irving, CMO
+- Turo — David Corns, CMO
+- Groq — Chelsey Susin Kantor, CMO
+- Mouthwash Studio = design agency partner, not a customer
+
+---
+
+## Known Issues (not yet fixed)
+
+| # | Issue | File | Priority |
+|---|-------|------|----------|
+| 1 | `/health` returns `"model": "claude-sonnet-4-6"` — stale from v1 | `api/main.py` line 158 | Low |
+| 2 | `GEMINI_OPENER_MODEL` misleadingly named — it's Groq llama-3.1-8b-instant | `router.py` line 15 | Low (naming only) |
+| 3 | N+1 Supabase queries (cache + cooldown = 2 SELECT per request) | `api/main.py` | Medium |
+| 4 | Global mutable `_client`/`_langfuse` not thread-safe | `scorer.py`, `router.py` | Medium |
+| 5 | Blocking I/O in `score_company()` (signal detection, enrichment) — blocks FastAPI event loop | `scorer.py` | High |
+| 6 | Webhook auth skipped silently when `WEBHOOK_SECRET` not set | `api/main.py` | Medium |
 
 ---
 
@@ -128,3 +237,14 @@ uvicorn api.main:app --reload --port 8000
 
 `D:\GTMSignolos\GTMFinalroadmapv1.md` — full changelog, v2.0 plan, job coverage matrix.
 Update this file whenever you change prompts, add features, or modify the architecture.
+
+## Target Jobs
+
+| Company | Role | Why This Project Hits It |
+|---------|------|--------------------------|
+| Anthropic | GTM Engineer / Solutions Architect | Evals dashboard, MCP server, multi-LLM production use |
+| Cohere | Forward Deployed Engineer | LangGraph, multi-LLM, customer-facing deployment |
+| Sierra | AI Engineer | Agent orchestration, CRM integration, real customer workflows |
+| Decagon | AI Engineer | Production AI system, Supabase, FastAPI, eval loops |
+| brand.ai | GTM Engineer | Clay + SignalOS demo, n8n, Python, LLM workflows |
+| Glean | GTM Engineer | Clay integration, signal detection, pipeline automation |

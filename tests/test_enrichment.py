@@ -31,10 +31,11 @@ APOLLO_RESPONSE = {
 @patch("scorer.enrichment.requests.get")
 def test_hunter_prefers_gtm_title(mock_get):
     mock_get.return_value = _mock_response(200, HUNTER_RESPONSE)
-    name, title, email = _hunter_lookup("acme.com")
+    name, title, email, contacts = _hunter_lookup("acme.com")
     assert title == "VP Sales"
     assert email == "jane@acme.com"
     assert name == "Jane Smith"
+    assert len(contacts) >= 1
 
 
 @patch("scorer.enrichment.APOLLO_API_KEY", "test-apollo-key")
@@ -71,8 +72,8 @@ def test_enrich_returns_empty_without_keys():
 @patch("scorer.enrichment.HUNTER_API_KEY", "test-key")
 @patch("scorer.enrichment.requests.get", side_effect=Exception("timeout"))
 def test_hunter_failure_never_raises(mock_get):
-    name, title, email = _hunter_lookup("acme.com")
-    assert name is None and title is None and email is None
+    name, title, email, contacts = _hunter_lookup("acme.com")
+    assert name is None and title is None and email is None and contacts == []
 
 
 @patch("scorer.enrichment.APOLLO_API_KEY", "test-key")

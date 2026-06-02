@@ -4,6 +4,7 @@ Run: python demo/app.py
 Requires: SIGNALOS_API_URL env var (default http://localhost:8000)
 """
 import os
+import re
 import json
 import gradio as gr
 import httpx
@@ -38,17 +39,38 @@ def score_company(
 ) -> tuple:
     tech_stack = [t.strip() for t in tech_stack_raw.split(",") if t.strip()]
 
+    # Clean domain — strip protocol, www, trailing slash
+    clean_domain = domain.strip()
+    clean_domain = re.sub(r"^https?://", "", clean_domain)
+    clean_domain = re.sub(r"^www\.", "", clean_domain)
+    clean_domain = clean_domain.rstrip("/")
+
+    # Clean company name — if user pasted a URL, extract name from it
+    clean_name = company_name.strip()
+    if "://" in clean_name or clean_name.startswith("www."):
+        clean_name = re.sub(r"^https?://", "", clean_name)
+        clean_name = re.sub(r"^www\.", "", clean_name)
+        clean_name = clean_name.rstrip("/")
+        # "sierra.ai" → "Sierra", "exaforce.com" → "Exaforce"
+        clean_name = clean_name.split(".")[0].capitalize()
+
+    if not clean_name or not clean_domain:
+        return "Enter company name and domain", "—", "—", "—", "—", "—", "—", "—", "—", "—", "{}"
+
+    # Only send manual signals if the user explicitly set any — otherwise auto-detect all 5
+    has_manual_signals = funded_90d or hiring_gtm or growth_pct > 0 or bool(tech_stack)
     payload = {
-        "company_name": company_name.strip(),
-        "domain": domain.strip().lstrip("https://").lstrip("http://").rstrip("/"),
+        "company_name": clean_name,
+        "domain": clean_domain,
         "client_id": client_id.strip() or "demo",
-        "signals": {
+    }
+    if has_manual_signals:
+        payload["signals"] = {
             "funded_90d": funded_90d,
             "hiring_gtm": hiring_gtm,
             "growth_pct": growth_pct,
             "tech_stack": tech_stack,
-        },
-    }
+        }
 
     try:
         resp = httpx.post(f"{api_url.rstrip('/')}/score-company", json=payload, timeout=60)
@@ -56,26 +78,29 @@ def score_company(
         data = resp.json()
     except httpx.HTTPStatusError as e:
         err = f"API error {e.response.status_code}: {e.response.text}"
-        return err, "—", "—", "—", "—", "—", "—", "{}"
+        return err, "—", "—", "—", "—", "—", "—", "—", "—", "—", "{}"
     except Exception as e:
-        return str(e), "—", "—", "—", "—", "—", "—", "{}"
+        return str(e), "—", "—", "—", "—", "—", "—", "—", "—", "—", "{}"
 
     if data.get("error"):
-        return data["error"], "—", "—", "—", "—", "—", "—", json.dumps(data, indent=2)
+        return data["error"], "—", "—", "—", "—", "—", "—", "—", "—", "—", json.dumps(data, indent=2)
 
     if data.get("suppressed"):
         note = f"Suppressed — {data.get('suppression_reason', 'cooldown active')}"
-        return note, "—", "—", "—", "—", "—", "—", json.dumps(data, indent=2)
+        return note, "—", "—", "—", "—", "—", "—", "—", "—", "—", json.dumps(data, indent=2)
 
     score_str      = _score_badge(data.get("score"))
     contact_window = data.get("contact_window") or "—"
     top_signal     = data.get("top_signal") or "—"
     aha_moment     = data.get("aha_moment") or "—"
+    situation      = data.get("situation") or "—"
+    talking_pts    = data.get("talking_points") or []
+    talking_pts_str = "\n".join(f"• {t}" for t in talking_pts) if talking_pts else "—"
     email_opener   = data.get("email_opener") or "—"
     reasoning      = data.get("reasoning") or "—"
     cost           = f"${data.get('cost_usd', 0):.4f}" if data.get("cost_usd") else "—"
 
-    status_parts = []
+    status_parts = [f"scored {clean_name} / {clean_domain}"]
     if data.get("cached"):
         status_parts.append("cached")
     if data.get("alerted_slack"):
@@ -84,17 +109,17 @@ def score_company(
         status_parts.append("CRM pushed")
     if data.get("requires_human_review"):
         status_parts.append("human review required")
-    status = " · ".join(status_parts) if status_parts else "scored"
+    status = " · ".join(status_parts)
 
-    return status, score_str, contact_window, top_signal, aha_moment, email_opener, reasoning, cost, json.dumps(data, indent=2)
+    return status, score_str, contact_window, top_signal, aha_moment, situation, talking_pts_str, email_opener, reasoning, cost, json.dumps(data, indent=2)
 
 
 def build_ui():
-    with gr.Blocks(title="SignalOS — GTM Signal Intelligence", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="SignalOS — GTM Signal Intelligence") as demo:
         gr.Markdown(
             """
 # SignalOS — GTM Signal Intelligence
-Score any company's buying intent using Claude Sonnet. Detects funding, hiring, leadership change, tech stack & growth signals.
+Score any company's buying intent. Detects funding, hiring, leadership change, tech stack & growth signals.
 """
         )
 
@@ -120,12 +145,14 @@ Score any company's buying intent using Claude Sonnet. Detects funding, hiring, 
                     status_out  = gr.Textbox(label="Status", interactive=False)
                     score_out   = gr.Textbox(label="Score", interactive=False)
                     window_out  = gr.Textbox(label="Contact Window", interactive=False)
-                    cost_out    = gr.Textbox(label="Claude Cost", interactive=False)
+                    cost_out    = gr.Textbox(label="Cost", interactive=False)
 
                 top_signal_out  = gr.Textbox(label="Top Signal", interactive=False)
                 aha_out         = gr.Textbox(label="Aha Moment", interactive=False, lines=2)
+                situation_out   = gr.Textbox(label="Intelligence Summary", interactive=False, lines=6)
+                talking_pts_out = gr.Textbox(label="Cold Call Hooks", interactive=False, lines=4)
                 opener_out      = gr.Textbox(label="Email Opener", interactive=False, lines=2)
-                reasoning_out   = gr.Textbox(label="Claude Reasoning", interactive=False, lines=4)
+                reasoning_out   = gr.Textbox(label="Reasoning", interactive=False, lines=3)
 
                 with gr.Accordion("Full JSON Response", open=False):
                     json_out = gr.Code(language="json", label="Raw API Response")
@@ -138,15 +165,15 @@ Score any company's buying intent using Claude Sonnet. Detects funding, hiring, 
             ],
             outputs=[
                 status_out, score_out, window_out, top_signal_out,
-                aha_out, opener_out, reasoning_out, cost_out, json_out,
+                aha_out, situation_out, talking_pts_out, opener_out, reasoning_out, cost_out, json_out,
             ],
         )
 
         gr.Examples(
             examples=[
-                [API_URL, "Notion", "notion.so", "demo", False, True, 40, "Salesforce, Slack"],
                 [API_URL, "Rippling", "rippling.com", "demo", True, True, 80, "Workday, Greenhouse"],
-                [API_URL, "Acme Corp", "acme.com", "demo", True, False, 0, "HubSpot"],
+                [API_URL, "Notion", "notion.so", "demo", False, True, 40, "Salesforce, Slack"],
+                [API_URL, "Exaforce", "exaforce.com", "demo", True, False, 0, ""],
             ],
             inputs=[api_url_box, company_input, domain_input, client_input, funded_check, hiring_check, growth_slider, tech_input],
             label="Example Companies",
@@ -157,4 +184,4 @@ Score any company's buying intent using Claude Sonnet. Detects funding, hiring, 
 
 if __name__ == "__main__":
     ui = build_ui()
-    ui.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    ui.launch(server_name="0.0.0.0", server_port=7860, share=False, theme=gr.themes.Soft())
