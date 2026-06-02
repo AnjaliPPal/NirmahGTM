@@ -1,12 +1,27 @@
 import os
+import asyncio
+import json
+import logging
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from scorer.scorer import score_company
-from scorer.models import CompanyInput, ScoreResult, Signals, EnrichmentData, CRMResult
+from scorer.models import CompanyInput, ScoreResult, Signals, EnrichmentData, CRMResult, EvalOutcome, EvalReport, BatchScoreRequest, BatchScoreResult
 from scorer.crm import push_to_hubspot
 from api.deps import get_supabase
 import httpx
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")
+except ImportError:
+    pass
+
+_FAILED_INSERTS_PATH = Path(__file__).parent.parent / "failed_inserts.jsonl"
 
 app = FastAPI(
     title="SignalOS",
@@ -14,14 +29,15 @@ app = FastAPI(
     version="1.2.0",
 )
 
+_CORS_ORIGINS = [o for o in os.environ.get("CORS_ORIGINS", "").split(",") if o] or ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization", "X-Signalos-Webhook-Secret"],
 )
 
-_CACHE_DAYS = int(os.environ.get("CACHE_DAYS", "14"))
+_CACHE_DAYS = int(os.environ.get("CACHE_DAYS", "28"))
 
 
 def _rehydrate(row: dict) -> ScoreResult:
@@ -43,7 +59,8 @@ async def score(company: CompanyInput):
     """
     # ── Domain validation: catch typos before burning tokens ─────────────────
     try:
-        r = httpx.head(f"https://{company.domain}", timeout=5, follow_redirects=True)
+        async with httpx.AsyncClient() as client:
+            r = await client.head(f"https://{company.domain}", timeout=5, follow_redirects=True)
         if r.status_code >= 400:
             return ScoreResult(
                 company_name=company.company_name,
@@ -81,9 +98,10 @@ async def score(company: CompanyInput):
             result.cached = True
             return result
     except Exception as e:
-        print(f"[WARN] Cache check failed: {e}")
+        logger.warning("Cache check failed for %s: %s", company.domain, e)
 
     # ── Cooldown: suppress re-alerting the same domain within 45 days ────────
+    supabase = None
     try:
         supabase = get_supabase()
         cutoff_45d = (datetime.utcnow() - timedelta(days=45)).isoformat()
@@ -107,16 +125,22 @@ async def score(company: CompanyInput):
                 suppression_reason=f"alerted within last 45 days (last: {recent.data[0]['created_at'][:10]})",
             )
     except Exception as e:
-        print(f"[WARN] Cooldown check failed: {e}")
+        logger.warning("Cooldown check failed for %s: %s", company.domain, e)
 
     # ── Cache miss — score fresh ───────────────────────────────────────────
-    result = score_company(company)
+    result = score_company(company, supabase=supabase)
 
     try:
         supabase = get_supabase()
         supabase.table("signals").insert(result.model_dump()).execute()
+        result.db_persisted = True
     except Exception as e:
-        print(f"[WARN] Supabase insert failed: {e}")
+        logger.error("Supabase insert failed for %s: %s — writing local backup", company.domain, e)
+        try:
+            with _FAILED_INSERTS_PATH.open("a") as f:
+                f.write(json.dumps(result.model_dump()) + "\n")
+        except Exception as backup_err:
+            logger.critical("BOTH Supabase AND local backup failed for %s: %s", company.domain, backup_err)
 
     return result
 
@@ -224,5 +248,164 @@ async def get_review_queue(client_id: str, limit: int = 20):
             .execute()
         )
         return {"client_id": client_id, "queue": response.data, "count": len(response.data)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+_WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+_ADMIN_API_KEY  = os.environ.get("ADMIN_API_KEY", "")
+
+
+@app.post("/webhook/hubspot-reply")
+async def hubspot_reply_webhook(
+    outcome: EvalOutcome,
+    x_signalos_webhook_secret: str = Header(default=""),
+):
+    """
+    Record what happened after a lead was scored — replied, closed, no_reply, bounced.
+
+    Call this from HubSpot workflows when a deal stage changes or a rep marks a reply.
+    Powers the /eval-report accuracy story: "v2.0 prompts had 78% reply rate."
+
+    Auth: set X-Signalos-Webhook-Secret header in your HubSpot workflow to match
+    the WEBHOOK_SECRET env var.
+    """
+    if not _WEBHOOK_SECRET or x_signalos_webhook_secret != _WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid webhook secret — set WEBHOOK_SECRET env var")
+
+    try:
+        supabase = get_supabase()
+
+        # Find the most recent signal for this domain+client so we can link it
+        sig_resp = (
+            supabase.table("signals")
+            .select("id, score, confidence, prompt_version")
+            .eq("domain", outcome.domain)
+            .eq("client_id", outcome.client_id)
+            .eq("scored", True)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        signal_row = sig_resp.data[0] if sig_resp.data else {}
+
+        row = {
+            "domain":              outcome.domain,
+            "client_id":           outcome.client_id,
+            "outcome":             outcome.outcome,
+            "hubspot_deal_id":     outcome.hubspot_deal_id,
+            "days_to_outcome":     outcome.days_to_outcome,
+            "signal_id":           signal_row.get("id"),
+            "score":               signal_row.get("score"),
+            "confidence":          signal_row.get("confidence"),
+            "prompt_version":      signal_row.get("prompt_version"),
+        }
+        supabase.table("eval_outcomes").insert(row).execute()
+        return {"recorded": True, "domain": outcome.domain, "outcome": outcome.outcome}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/eval-report/{client_id}")
+async def eval_report(client_id: str):
+    """
+    Return reply/close rates broken down by prompt_version.
+
+    Example output: "v2.0 → 78% reply rate, 45% close rate across 89 leads"
+    Use this to prove your prompts improved over time.
+    """
+    try:
+        supabase = get_supabase()
+        resp = (
+            supabase.table("eval_outcomes")
+            .select("prompt_version, outcome, score")
+            .eq("client_id", client_id)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Group by prompt_version in Python (Supabase free tier has no GROUP BY via SDK)
+    from collections import defaultdict
+    buckets: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        version = row.get("prompt_version") or "unknown"
+        buckets[version].append(row.get("outcome", "no_reply"))
+
+    reports = []
+    for version, outcomes in sorted(buckets.items()):
+        total   = len(outcomes)
+        replied = outcomes.count("replied")
+        closed  = outcomes.count("closed")
+        reports.append(EvalReport(
+            client_id=client_id,
+            prompt_version=version,
+            total=total,
+            replied=replied,
+            closed=closed,
+            no_reply=outcomes.count("no_reply"),
+            bounced=outcomes.count("bounced"),
+            reply_rate=round(replied / total, 3) if total else 0.0,
+            close_rate=round(closed / total, 3) if total else 0.0,
+        ))
+
+    return {"client_id": client_id, "versions": [r.model_dump() for r in reports], "total_outcomes": len(rows)}
+
+
+@app.post("/batch-score", response_model=BatchScoreResult)
+async def batch_score(req: BatchScoreRequest):
+    """
+    Score multiple companies in parallel using the LangGraph fan-out agent.
+
+    Accepts up to 50 companies. Each is scored concurrently; results are ranked
+    by score and Claude synthesizes a VP-of-Sales-ready executive brief.
+
+    Requires: pip install langgraph>=0.2.0
+    """
+    if len(req.companies) > 50:
+        raise HTTPException(status_code=400, detail="max 50 companies per batch request")
+
+    try:
+        from scorer.agent import run_batch
+    except ImportError:
+        raise HTTPException(status_code=503, detail="LangGraph not installed. Run: pip install langgraph>=0.2.0")
+
+    try:
+        result = await asyncio.to_thread(run_batch, req.companies, req.min_score)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return BatchScoreResult(
+        total_scored=result["total_scored"],
+        hot_leads_count=result["hot_leads_count"],
+        ranked=result["ranked"],
+        summary=result["summary"],
+    )
+
+
+@app.get("/admin/failed-inserts")
+async def get_failed_inserts(x_admin_key: str = Header(default="")):
+    """
+    Return any Supabase inserts that failed and were written to the local backup file.
+    Use this to replay missed writes manually after fixing the DB connection.
+
+    Auth: set X-Admin-Key header to match the ADMIN_API_KEY env var.
+    """
+    if not _ADMIN_API_KEY or x_admin_key != _ADMIN_API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid admin key — set ADMIN_API_KEY env var")
+
+    if not _FAILED_INSERTS_PATH.exists():
+        return {"count": 0, "records": []}
+    try:
+        records = []
+        with _FAILED_INSERTS_PATH.open() as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        return {"count": len(records), "records": records}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
