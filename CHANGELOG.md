@@ -5,9 +5,33 @@ Format: [keepachangelog.com](https://keepachangelog.com/en/1.0.0/), semantic ver
 
 ## [Unreleased]
 
-- Phase B: Multi-LLM cost breakdown — wire per-call costs from pre-filter, scoring, and opener into `model_costs` field on every run
-- Phase C: pgvector RAG — enable Supabase `vector` extension, wire `retrieve_similar()` into scoring prompt
 - Phase D: Public endpoint (ngrok) + Clay Custom HTTP demo table + SignalOS Loom
+- Phase B: Multi-LLM cost breakdown — wire per-call costs from pre-filter, scoring, and opener into `model_costs` field on every run
+
+---
+
+## [2.6.0] - 2026-06-02
+
+### Added
+- `mcp_server.py` — FastMCP server exposes 3 tools to Claude Desktop: `score_company_tool` (full pipeline score), `get_hot_leads` (fetch ready accounts from Supabase), `get_pitch` (retrieve cached pitch block without re-running pipeline).
+- `scorer/rag.py` (Phase C) — pgvector RAG layer. OpenAI `text-embedding-3-small` embeds each scored company into Supabase `signals.embedding` column. `retrieve_similar()` calls `match_signals()` SQL RPC for cosine top-5 similar past accounts. `format_rag_context()` injects retrieved context into scoring prompt. Degrades gracefully when `OPENAI_API_KEY` not set.
+- `scorer/agent.py` (Phase B) — LangGraph fan-out batch agent scores up to 50 companies in parallel. Sequential fallback when LangGraph not installed. `run_batch()` ranks by score, calls Groq `llama-3.3-70b-versatile` for VP-of-Sales executive brief.
+- `POST /batch-score` — HTTP endpoint wrapping `run_batch()` via `asyncio.to_thread`. Returns `BatchScoreResult` with ranked leads and summary.
+- `POST /webhook/hubspot-reply` — records deal outcome (replied/closed/no_reply/bounced) in `eval_outcomes` table. Powers reply-rate accuracy reporting. Auth: `WEBHOOK_SECRET` env var required (fail-closed).
+- `GET /eval-report/{client_id}` — returns reply/close rates grouped by `prompt_version`. Proves prompt improvement over time.
+- `GET /admin/failed-inserts` — returns Supabase write failures buffered to local JSONL. Auth: `ADMIN_API_KEY` env var required (fail-closed).
+- 5 new migration files (`db/migrations/001-005`, `supabase/migrations/`) for pgvector column, eval_outcomes table, and multi-LLM routing tables.
+- `scripts/migrate.py` — one-command migration runner.
+- 27 new pytest tests (90 → 117): test_mcp.py, test_rag.py, test_router.py, test_agent.py, test_research_target.py, test_eval.py, plus unit tests for `_estimate_acv`, `_contact_window_from_date`, new API endpoints.
+
+### Fixed (Security)
+- `api/main.py` — webhook and admin auth now **fail-closed**: when `WEBHOOK_SECRET`/`ADMIN_API_KEY` env vars are unset, all requests are rejected (previously skipped auth silently).
+- `scorer/scorer.py` — `scoring_context` (caller-supplied) wrapped in `<clay_context>` delimiters to prevent prompt injection.
+- `scorer/scorer.py` — LLM-returned contact indices clamped with `max(0, min(int(idx), n-1))` before array access; prevents `IndexError` on hallucinated values.
+- `api/main.py` — `/batch-score` enforces max 50 companies; rejects oversized requests with HTTP 400.
+- `scorer/rag.py`, `scorer/router.py` — silent `except: pass` blocks replaced with `logger.warning()` so Supabase/Groq failures surface in logs.
+
+**Tests: 117/117**
 
 ---
 
