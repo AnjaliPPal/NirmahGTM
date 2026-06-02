@@ -7,3 +7,18 @@ venv/
 dist/
 .pytest_cache/
 .mypy_cache/
+
+# Supabase local dev (not needed in CI — remote project is source of truth)
+supabase/.branches/
+supabase/.temp/
+
+# Broken pip install artifacts (created by running pip install in wrong directory)
+=*
+
+# Node (npm was accidentally run in this Python project directory)
+node_modules/
+package.json
+package-lock.json
+
+# Runtime data — not source code
+failed_inserts.jsonl
