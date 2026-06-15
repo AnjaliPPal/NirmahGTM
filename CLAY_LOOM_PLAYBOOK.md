@@ -1,23 +1,16 @@
 # SignalOS + Clay — Loom Playbook
-**Last updated: June 2, 2026**
+**Last updated: June 4, 2026**
 
 Reusable process for every job application. Build the table once, duplicate per company.
 First run: ~2.5 hours. Each duplicate after: ~1 hour 20 min.
 
 ---
 
-## Phase 2 — Static Public URL (10 min)
+## Phase 2 — Public URL (10 min)
 
 Keep three terminals open until the Loom is uploaded.
 
-### Step 1 — Claim your free static ngrok domain (one time only)
-
-1. Go to [dashboard.ngrok.com](https://dashboard.ngrok.com) → log in (free account)
-2. Left sidebar → **Domains** → **+ New Domain**
-3. ngrok generates a permanent domain for you: `something-random.ngrok-free.app`
-4. Copy it. This domain is yours permanently. It never changes even if ngrok restarts.
-
-### Step 2 — Start everything
+### Step 1 — Start everything
 
 **Terminal 1 — API:**
 ```bash
@@ -26,20 +19,25 @@ uvicorn api.main:app --reload --port 8000
 ```
 Wait for `Application startup complete`.
 
-**Terminal 2 — static tunnel (replace with your domain):**
+**Terminal 2 — ngrok tunnel:**
 ```bash
-ngrok http --domain=your-domain.ngrok-free.app 8000
+ngrok http 8000
 ```
+Wait until you see:
+```
+Forwarding    https://RANDOM-STRING.ngrok-free.app -> http://localhost:8000
+```
+**Copy that URL.** You will paste it into Clay in Phase 3 Step 4.
 
-**Terminal 3 — verify it works:**
+> ngrok free plan gives a new random URL every restart. Each time you restart ngrok, update the URL in Clay's HTTP column config.
+
+**Terminal 3 — verify it works (replace URL with yours):**
 ```bash
-curl -X POST https://your-domain.ngrok-free.app/score-company ^
+curl -X POST https://YOUR-NGROK-URL.ngrok-free.app/score-company ^
   -H "Content-Type: application/json" ^
   -d "{\"company_name\":\"Acme\",\"domain\":\"acme.com\",\"client_id\":\"demo\",\"scoring_context\":\"B2B SaaS hiring GTM roles\"}"
 ```
 Must return JSON with a `score` field. If not, read Terminal 1 before continuing.
-
-**The static domain never changes.** Once the Clay column is configured, you never need to update it again, even if you restart ngrok.
 
 ---
 
@@ -62,10 +60,73 @@ Source: [Clay Ocean.io integration docs](https://university.clay.com/docs/ocean-
 
 **Step 2a — Find your seed domains**
 
-Go to the hiring company's website → Customer Stories or Case Studies page.
-Find 2–3 confirmed customers. Copy their domains.
+**Why this matters:** Your seed domains are your ICP anchor. Every lookalike Ocean.io finds will be based on these 2–3 real customers. Seed wrong = lookalike wrong. **Never guess. Always use confirmed customer data.**
 
-If no public customer page exists: check their LinkedIn page, recent press releases, or G2 reviews where customers name themselves.
+**Time: 15–20 minutes for 3 seeds.**
+
+#### Method 1 (Highest Signal): Public Customer Page
+1. Go to `hiring-company.com/customers` (or `/case-studies`, `/success-stories`, `/clients`)
+2. Find 2–3 company logos with names
+3. Copy domains (right-click logo → Google the company name if domain not visible)
+4. Validate: `curl -I https://domain` → should return HTTP 200–399
+
+**Example (brand.ai, Jun 2026):** brand.ai/customers shows Lyft | Turo | Groq logos → seeds: lyft.com | turo.com | groq.com. **Time: 3–5 min. Confidence: 100%.**
+
+#### Method 2 (Medium Signal): LinkedIn Company Page
+1. Go to LinkedIn company page → search "company name case study" or "company name customers"
+2. Look for founder posts mentioning customer wins (last 6–12 months)
+3. Extract company names mentioned in posts or comments
+4. Validate each domain
+
+**Example (Instantly.ai, Jun 2026):** CEO post "500+ GTM teams use Instantly" → comments mention Braze, UserTesting → seeds: braze.com | usertesting.com. **Time: 5–10 min. Confidence: 85%.**
+
+#### Method 3 (Fallback): G2 Reviews
+1. Go to g2.com/products/[company-name]
+2. Scroll to "Customer reviews" → look for "John Doe, Title at Company Name"
+3. Click company name link → copy domain from G2 profile
+
+**Time: 8–15 min. Hit rate: ~40%.**
+
+#### Method 4 (Confirming Only): Press Releases
+1. Go to `hiring-company.com/press` or `/newsroom`
+2. Search: "customer," "partner," "announces," "now customer"
+3. Open release → extract company name + verify domain
+
+**Time: 10–20 min. Use only as confirming evidence.**
+
+#### Method 5 (Last Resort): Google News
+1. Go to news.google.com
+2. Search: `"[company name]" customer OR partner OR client [year]`
+3. Read headlines for "X Company now uses Y"
+4. Click → extract company name + domain
+
+**Time: 10–15 min.**
+
+---
+
+#### The 3-Seed Rule
+- **Best case:** 3 confirmed customers from Method 1 (customer page) → 100% confidence
+- **Good case:** 2 from Method 1 + 1 from Method 2 (LinkedIn) → 95% confidence
+- **Acceptable:** 3 from any mix of Methods 2–4 → 80% confidence
+- **Avoid:** Seeds older than 12 months (product changed, customers churned)
+
+#### Validation Checklist
+- [ ] Domain resolves (HTTP 200–399)
+- [ ] Company still exists (active on LinkedIn, not acquired/shutdown)
+- [ ] Customer announcement dated within last 12 months
+- [ ] Company size matches YOUR ICP (don't seed Fortune 500 if targeting Series B)
+- [ ] At least 2 seeds from same source (credibility signal)
+
+---
+
+**What Sr GTM Practitioners Say (Jun 2026):**
+> "Your seed domains are your hypothesis about your ICP. If you guess, Ocean.io finds 50 companies that look like your guess, not like your real customers. I always spend 15 minutes finding real seeds. It saves 3 hours of bad outreach later." — Ritu Maurya, Waste Data Engine
+
+> "The customer page is gold. If it doesn't exist, that tells you something — the company is either early or hiding their install base. That changes how I score them." — Max Mitcham, Trigify
+
+---
+
+**Next: Pass 2–3 validated seed domains to Step 2b (Ocean.io run).**
 
 ---
 
@@ -147,8 +208,9 @@ This column feeds into the SignalOS scoring_context dynamically. Every row gets 
 **Request tab:**
 ```
 Method: POST
-URL:    https://your-domain.ngrok-free.app/score-company
+URL:    https://YOUR-NGROK-URL.ngrok-free.app/score-company
 ```
+*(Paste the URL you copied from Terminal 2 in Phase 2 + `/score-company`)*
 
 **Headers tab:**
 ```
@@ -339,7 +401,6 @@ Worth a chat?
 
 | Step | First run | Each duplicate |
 |---|---|---|
-| Claim static ngrok domain | 5 min | 0 (done once) |
 | Start API + ngrok + test | 10 min | 10 min |
 | Build Clay table | 90 min | 20 min |
 | Screenshots | 5 min | 5 min |

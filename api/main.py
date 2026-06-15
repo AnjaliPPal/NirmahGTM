@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from scorer.scorer import score_company
-from scorer.models import CompanyInput, ScoreResult, Signals, EnrichmentData, CRMResult, EvalOutcome, EvalReport, BatchScoreRequest, BatchScoreResult
+from scorer.models import CompanyInput, ScoreResult, Signals, EnrichmentData, CRMResult, EvalOutcome, EvalReport, BatchScoreRequest, BatchScoreResult, ReplyClassifyRequest, ReplyClassifyResult
 from scorer.crm import push_to_hubspot
 from api.deps import get_supabase
 import httpx
@@ -54,7 +54,7 @@ async def score(company: CompanyInput):
     """
     Score a company's buying intent.
 
-    Cache: returns cached result if same domain+client scored within CACHE_DAYS (default 14).
+    Cache: returns cached result if same domain+client scored within CACHE_DAYS (default 28).
     Quarantine: low-confidence leads route to #human-review-required, not main Slack.
     """
     # ── Domain validation: catch typos before burning tokens ─────────────────
@@ -128,7 +128,10 @@ async def score(company: CompanyInput):
         logger.warning("Cooldown check failed for %s: %s", company.domain, e)
 
     # ── Cache miss — score fresh ───────────────────────────────────────────
-    result = score_company(company, supabase=supabase)
+    # score_company is synchronous and does blocking network I/O (signal
+    # detection, enrichment, LLM calls). Run it off the event loop so it
+    # doesn't stall concurrent requests.
+    result = await asyncio.to_thread(score_company, company, supabase=supabase)
 
     try:
         supabase = get_supabase()
@@ -155,7 +158,7 @@ async def health():
         db_status = f"error: {str(e)}"
     return {
         "status": "ok",
-        "model": "claude-sonnet-4-6",
+        "model": "llama-3.3-70b-versatile",
         "version": "1.2.0",
         "score_threshold": int(os.environ.get("SCORE_THRESHOLD", "6")),
         "confidence_threshold": int(os.environ.get("CONFIDENCE_THRESHOLD", "80")),
@@ -384,6 +387,26 @@ async def batch_score(req: BatchScoreRequest):
         ranked=result["ranked"],
         summary=result["summary"],
     )
+
+
+@app.post("/classify-reply", response_model=ReplyClassifyResult)
+async def classify_reply(req: ReplyClassifyRequest):
+    """
+    Classify an inbound email reply and return routing decision.
+
+    Labels: hot / warm / not_now / not_interested / out_of_office / bounce
+    Routing: human / nurture / suppress / auto-reply
+
+    - hot      → human      (forward to rep immediately)
+    - warm     → nurture    (add to follow-up sequence)
+    - not_now  → nurture    (retry in 30-60 days)
+    - not_interested → suppress   (remove from sequence)
+    - out_of_office  → auto-reply (retry when they return)
+    - bounce         → suppress   (invalid address, update contact data)
+    """
+    from scorer.router import classify_reply as _classify
+    result = await asyncio.to_thread(_classify, req.reply_text, req.context)
+    return ReplyClassifyResult(**result)
 
 
 @app.get("/admin/failed-inserts")

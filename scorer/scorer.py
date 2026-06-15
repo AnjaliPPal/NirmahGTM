@@ -282,7 +282,15 @@ def _get_client() -> Groq:
     return _client
 
 
-def score_company(company: CompanyInput, supabase=None) -> ScoreResult:
+def score_company(company: CompanyInput, supabase=None, dry_run: bool = False) -> ScoreResult:
+    """Score a company's buying intent.
+
+    dry_run=True skips the two outward side effects (Slack alert + HubSpot push)
+    so the full reasoning pipeline can be exercised offline — e.g. by the eval
+    harness in `evals/` — without spamming real channels or the CRM. Scoring,
+    opener, situation, and talking points still run. RAG store/retrieve is
+    already gated on `supabase is not None`.
+    """
     # ── Auto-detect signals if not manually provided ───────────────────────
     auto_detected = company.signals is None
     signals = company.signals or detect_signals(company.domain, company.company_name)
@@ -575,11 +583,11 @@ def score_company(company: CompanyInput, supabase=None) -> ScoreResult:
         store_embedding(result, supabase)
 
     # ── Step 4: Alert — main channel or #human-review-required ───────────
-    if result.score >= SCORE_THRESHOLD:
+    if result.score >= SCORE_THRESHOLD and not dry_run:
         result.alerted_slack = send_slack_alert(result)
 
     # ── Step 5: CRM push — high-confidence leads only, auto into HubSpot ─
-    if result.score >= SCORE_THRESHOLD and not result.requires_human_review:
+    if result.score >= SCORE_THRESHOLD and not result.requires_human_review and not dry_run:
         crm = push_to_hubspot(result)
         if crm.pushed:
             result.pushed_to_crm      = True

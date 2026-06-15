@@ -1,5 +1,5 @@
 # SignalOS — CLAUDE.md
-# Last updated: May 30, 2026
+# Last updated: June 3, 2026
 # Rule: update this file every time the architecture, LLM stack, or test count changes.
 
 ## What This Project Is
@@ -62,7 +62,9 @@ Clay table row → POST /score-company
 
 **Note on naming:** `router.py` exports `GEMINI_OPENER_MODEL = "llama-3.1-8b-instant"` — the variable is named "Gemini" but actually runs Groq. Historical naming artefact. Do not change without updating scorer.py imports.
 
-**Note on /health:** The `/health` endpoint returns `"model": "claude-sonnet-4-6"` — this string is stale (leftover from v1). Actual scoring model is Groq llama-3.3-70b-versatile. Fix: update `api/main.py` line 158.
+**Note on reply classification:** `/classify-reply` (new June 3) labels incoming emails as hot/warm/not_now/not_interested/out_of_office/bounce. Routes to human/nurture/suppress/auto-reply. Implemented in `scorer/router.py` + `api/main.py`.
+
+**Note on /health:** The `/health` endpoint reports `"model": "llama-3.3-70b-versatile"` (fixed June 5 2026 — previously a stale `claude-sonnet-4-6` string from v1).
 
 ---
 
@@ -82,7 +84,7 @@ Clay table row → POST /score-company
 | `scorer/crm.py` | HubSpot: upsert contact (409 fallback), create deal, associate |
 | `scorer/slack.py` | Slack Block Kit ROI alert (main channel) + quarantine routing (#human-review-required) |
 | `mcp_server.py` | FastMCP server — 3 tools: score_company_tool / get_hot_leads / get_pitch |
-| `api/main.py` | FastAPI routes: /score-company, /batch-score, /health, /leads, /push-to-crm, /review-queue, /webhook/hubspot-reply, /eval-report, /admin/failed-inserts |
+| `api/main.py` | FastAPI routes: /score-company, /batch-score, /classify-reply, /health, /leads, /push-to-crm, /review-queue, /webhook/hubspot-reply, /eval-report, /admin/failed-inserts |
 | `api/deps.py` | Supabase client singleton |
 | `demo/app.py` | Gradio UI — type domain, get full score result. Run: `python demo/app.py` (port 7860) |
 | `db/schema.sql` | Canonical Supabase schema — must stay in sync with models.py |
@@ -90,6 +92,9 @@ Clay table row → POST /score-company
 | `n8n/signalos_workflow.json` | Importable n8n workflow (scheduled scoring orchestration) |
 | `skills/brand-ai-outbound/run.py` | brand.ai application workflow — research → brand signal check → score → 4 output files |
 | `skills/brand-ai-outbound/CLAUDE.md` | Documentation for the brand-ai-outbound workflow |
+| `evals/golden_set.py` | Offline eval — ~30 hand-labeled cases with fixed Signals (deterministic) |
+| `evals/metrics.py` | Pure eval metric math (band accuracy, separation, top-signal, calibration) |
+| `evals/run_eval.py` | Eval runner — scores golden set via `score_company(dry_run=True)`, prints scorecard, regression gate |
 
 ---
 
@@ -157,7 +162,9 @@ pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
-90/90 tests passing as of May 31 2026. Run before every code change.
+153/153 tests passing as of June 5 2026. Run before every code change.
+
+**Offline eval (separate from pytest):** `python evals/run_eval.py` scores the labeled golden set through the real pipeline and prints band accuracy / separation / calibration with a `--min-accuracy` regression gate. Needs GROQ_API_KEY; all other integrations auto-disabled for determinism. See `evals/README.md`.
 
 Test files:
 - `tests/test_scorer.py` — core scoring logic, mock Groq calls
@@ -170,6 +177,8 @@ Test files:
 - `tests/test_agent.py` — LangGraph fan-out, ranking, suppressed exclusion, summary
 - `tests/test_eval.py` — webhook recording, eval report math
 - `tests/test_research_target.py` — customer extraction (clean/dedup/sources), graceful degradation
+- `tests/test_reply_classifier.py` — reply classification (all 6 labels, routing, rule-based fallback, endpoint)
+- `tests/test_evals.py` — eval metric math, golden-set integrity, dry_run side-effect gate
 
 ---
 
@@ -224,12 +233,13 @@ python skills/brand-ai-outbound/run.py
 
 | # | Issue | File | Priority |
 |---|-------|------|----------|
-| 1 | `/health` returns `"model": "claude-sonnet-4-6"` — stale from v1 | `api/main.py` line 158 | Low |
 | 2 | `GEMINI_OPENER_MODEL` misleadingly named — it's Groq llama-3.1-8b-instant | `router.py` line 15 | Low (naming only) |
 | 3 | N+1 Supabase queries (cache + cooldown = 2 SELECT per request) | `api/main.py` | Medium |
 | 4 | Global mutable `_client`/`_langfuse` not thread-safe | `scorer.py`, `router.py` | Medium |
-| 5 | Blocking I/O in `score_company()` (signal detection, enrichment) — blocks FastAPI event loop | `scorer.py` | High |
+| 5 | `score_company()` is still synchronous — `/score-company` offloads via `asyncio.to_thread`, but MCP server + `agent.py` callers still block | `scorer.py` | Medium |
 | 6 | Webhook auth skipped silently when `WEBHOOK_SECRET` not set | `api/main.py` | Medium |
+
+**Fixed June 5 2026:** #1 `/health` stale model string; original #5 `/score-company` event-loop blocking (now `asyncio.to_thread`); `openai` added to `requirements.txt` (RAG + pre-filter were silently disabled on clean installs); `CACHE_DAYS` reconciled to 28.
 
 ---
 

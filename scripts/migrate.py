@@ -7,6 +7,7 @@ Usage:
 """
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 import io
 
@@ -26,15 +27,15 @@ ROOT = Path(__file__).parent.parent
 DRY_RUN = "--dry-run" in sys.argv
 
 
-def run_sql(sql: str, label: str) -> bool:
+def run_query_file(path, label) -> bool:
     if DRY_RUN:
         print(f"[dry-run] would execute: {label}")
         return True
     result = subprocess.run(
-        ["supabase", "db", "execute", "--project-ref", PROJECT_REF],
-        input=sql,
+        ["supabase", "db", "query", "--file", str(path), "--linked"],
         text=True,
         capture_output=True,
+        shell=True,
     )
     if result.returncode != 0:
         print(f"  FAILED: {result.stderr.strip()}")
@@ -45,11 +46,16 @@ def run_sql(sql: str, label: str) -> bool:
 def main():
     print(f"Target project: {PROJECT_REF} (NirmahGTM)\n")
 
-    # Step 1: enable pgvector
-    print("→ Enabling pgvector extension...")
-    ok = run_sql("CREATE EXTENSION IF NOT EXISTS vector;", "CREATE EXTENSION vector")
+    # Step 1: enable pgvector -- via a temp file, not an inline CLI arg
+    # (avoids cmd.exe / npm .cmd-shim quoting issues with semicolons/spaces)
+    print("-> Enabling pgvector extension...")
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False, encoding="utf-8")
+    tmp.write("CREATE EXTENSION IF NOT EXISTS vector;")
+    tmp.close()
+    ok = run_query_file(tmp.name, "CREATE EXTENSION vector")
+    Path(tmp.name).unlink(missing_ok=True)
     if not ok:
-        print("  pgvector enable failed — continuing (may already exist)")
+        print("  pgvector enable failed -- continuing (may already exist)")
     else:
         print("  done")
 
@@ -59,10 +65,9 @@ def main():
         if not path.exists():
             print(f"  SKIP {rel_path} (file not found)")
             continue
-        sql = path.read_text(encoding="utf-8")
-        print(f"→ {rel_path}")
-        ok = run_sql(sql, rel_path)
-        print("  done" if ok else "  FAILED — stopping")
+        print(f"-> {rel_path}")
+        ok = run_query_file(path, rel_path)
+        print("  done" if ok else "  FAILED -- stopping")
         if not ok:
             sys.exit(1)
 

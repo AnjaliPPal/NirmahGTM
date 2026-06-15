@@ -141,3 +141,80 @@ def groq_json_extract(prompt: str, max_tokens: int = 500) -> list[dict]:
     except Exception as e:
         logger.warning("groq_json_extract failed: %s", e)
         return []
+
+
+_VALID_LABELS = {"hot", "warm", "not_now", "not_interested", "out_of_office", "bounce"}
+
+_LABEL_TO_ROUTING = {
+    "hot":            "human",
+    "warm":           "nurture",
+    "not_now":        "nurture",
+    "not_interested": "suppress",
+    "out_of_office":  "auto-reply",
+    "bounce":         "suppress",
+}
+
+_CLASSIFY_PROMPT = """You are a reply classifier for B2B sales emails. Classify the inbound reply below.
+
+Reply:
+{reply_text}
+{context_block}
+Classify into exactly one label:
+- hot: clear positive interest — wants to connect, asks product questions, agrees to a call
+- warm: mildly interested, curious, not rejecting — needs more info
+- not_now: explicit timing objection ("Q4", "after budget cycle", "too busy right now")
+- not_interested: flat rejection, wrong person, not relevant, unsubscribe request
+- out_of_office: auto-reply or manual OOO message
+- bounce: delivery failure, invalid email, hard bounce notification
+
+Return JSON only. No markdown, no explanation outside JSON.
+{{"label": "...", "reason": "one sentence max — specific to this reply", "confidence": 0-100}}"""
+
+
+def classify_reply(reply_text: str, context: str | None = None) -> dict:
+    """
+    Classify an inbound email reply.
+    Returns dict with label, reason, routing, confidence.
+    Falls back to rule-based on any LLM failure.
+    """
+    context_block = f"\nContext: {context}\n" if context else ""
+    prompt = _CLASSIFY_PROMPT.format(reply_text=reply_text, context_block=context_block)
+
+    try:
+        resp = _get_groq_opener().chat.completions.create(
+            model=GEMINI_OPENER_MODEL,
+            max_tokens=120,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = resp.choices[0].message.content.strip()
+        text = re.sub(r"^```(?:json)?\n?", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\n?```$", "", text)
+        parsed = json.loads(text)
+
+        label = parsed.get("label", "").lower().strip()
+        if label not in _VALID_LABELS:
+            label = "not_interested"
+        reason = str(parsed.get("reason", "No reason provided"))[:300]
+        confidence = max(0, min(100, int(parsed.get("confidence", 70))))
+
+    except Exception as e:
+        logger.warning("classify_reply LLM call failed: %s — using rule-based fallback", e)
+        text_lower = reply_text.lower()
+        if any(w in text_lower for w in ["out of office", "ooo", "on leave", "annual leave", "vacation", "away until"]):
+            label, reason, confidence = "out_of_office", "OOO keywords detected", 90
+        elif any(w in text_lower for w in ["unsubscribe", "remove me", "not interested", "no thank", "stop emailing"]):
+            label, reason, confidence = "not_interested", "Rejection keywords detected", 85
+        elif any(w in text_lower for w in ["q4", "next quarter", "next year", "budget", "too busy", "not right now"]):
+            label, reason, confidence = "not_now", "Timing objection detected", 80
+        elif any(w in text_lower for w in ["yes", "sure", "interested", "tell me more", "sounds good", "let's connect"]):
+            label, reason, confidence = "hot", "Positive intent keywords detected", 75
+        else:
+            label, reason, confidence = "warm", "No clear rejection or acceptance", 50
+
+    return {
+        "label":      label,
+        "reason":     reason,
+        "routing":    _LABEL_TO_ROUTING.get(label, "nurture"),
+        "confidence": confidence,
+    }

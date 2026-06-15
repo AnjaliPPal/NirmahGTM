@@ -158,3 +158,15 @@ class BatchScoreResult(BaseModel):
     hot_leads_count: int
     ranked: list[ScoreResult]
     summary: str
+
+
+class ReplyClassifyRequest(BaseModel):
+    reply_text: str = Field(..., min_length=1, max_length=5000)
+    context: Optional[str] = None   # e.g. "outreach for Instantly.ai email platform"
+
+
+class ReplyClassifyResult(BaseModel):
+    label: str      # hot / warm / not_now / not_interested / out_of_office / bounce
+    reason: str     # one sentence
+    routing: str    # human / nurture / suppress / auto-reply
+    confidence: int = Field(..., ge=0, le=100)

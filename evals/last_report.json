@@ -1,0 +1,26 @@
+{
+  "prompt_version": "v2.0",
+  "cases": 30,
+  "band_accuracy": {
+    "correct": 30,
+    "total": 30,
+    "accuracy": 1.0
+  },
+  "separation": {
+    "pass": true,
+    "min_high": 7,
+    "max_low": 2
+  },
+  "top_signal_agreement": {
+    "matches": 3,
+    "labeled": 4,
+    "agreement": 0.75
+  },
+  "confidence_calibration": {
+    "avg_confidence_correct": 69.8,
+    "avg_confidence_incorrect": null,
+    "n_correct": 25,
+    "n_incorrect": 0
+  },
+  "failures": []
+}

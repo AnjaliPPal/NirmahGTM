@@ -80,7 +80,7 @@ def test_health_endpoint():
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "ok"
-    assert data["model"] == "claude-sonnet-4-6"
+    assert data["model"] == "llama-3.3-70b-versatile"
 
 
 @patch("api.main.httpx.AsyncClient")

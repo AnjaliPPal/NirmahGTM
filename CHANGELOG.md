@@ -5,6 +5,22 @@ Format: [keepachangelog.com](https://keepachangelog.com/en/1.0.0/), semantic ver
 
 ## [Unreleased]
 
+### Added
+- **Offline eval harness** (`evals/`) — labeled golden set + runner that scores it through the real pipeline and reports **band accuracy, high/low separation, top-signal agreement, and confidence calibration**, with a `--min-accuracy` regression gate (exits non-zero on quality drop). Directly matches the "build evaluation frameworks — prompt evals, agent benchmarking, regression testing" requirement named in current FDE/GTM-Engineer JDs (Toast, DevRev, Databricks, HUD). Files: `evals/golden_set.py` (~30 hand-labeled cases with fixed `Signals` for determinism), `evals/metrics.py` (pure, unit-tested metric math), `evals/run_eval.py` (runner + scorecard + JSON report), `evals/README.md`. First full run: **30/30 band accuracy, separation PASS**.
+- `scorer/scorer.py` — `score_company(..., dry_run=False)` param. `dry_run=True` runs the full reasoning pipeline but skips the Slack alert + HubSpot push, so the eval harness can exercise scoring offline without side effects. Default `False` = no behavior change for existing callers.
+- `.env.example` — placeholder env file (no secrets) so the README quickstart's `cp .env.example .env` works on a clean clone.
+- 19 new tests in `tests/test_evals.py` (metric math, golden-set integrity, dry_run gate). **134 → 153.**
+
+### Fixed
+- `api/deps.py` — **placeholder Supabase service-role key no longer breaks the DB.** `get_supabase()` did `SERVICE_ROLE_KEY or PUBLISHABLE_KEY`; the `.env` placeholder `eyJ...paste_your_service_role_key_here` is a non-empty string, so it won the `or` and every real Supabase call 401'd. Now a `_real()` guard ignores placeholder values (`...`, `paste`, `your_`, etc.) and falls back to the working publishable key. Tests mocked Supabase, so this never surfaced in CI.
+- `scripts/check_setup.py` (NEW) — setup preflight. Classifies every credential as SET / PLACEHOLDER / MISSING, flags when the Slack review webhook equals the main one, and live-checks Supabase (signals table reachable? `match_signals` RPC present for RAG?). Read-only, ASCII output. Run: `python scripts/check_setup.py`.
+- `README.md` — corrected stale facts a reviewer would catch: "4 signals"→5, "ANTHROPIC_API_KEY"→"GROQ_API_KEY", "Claude Sonnet"→"Groq llama-3.3-70b-versatile", fixed the broken `cp .env.example` quickstart, and added an Evals section.
+- `requirements.txt` — added `openai>=1.0.0`. It was imported by `scorer/rag.py` and `scorer/router.py` but never declared, so on a clean install the pgvector RAG (Phase C) and GPT-4o-mini pre-filter silently no-op'd (import guarded → returned `None`). Now installable out of the box.
+- `api/main.py` — `/score-company` now runs the synchronous, blocking `score_company()` via `asyncio.to_thread` instead of calling it directly inside the `async` route. Previously every score blocked the FastAPI event loop and stalled concurrent requests. (Addresses the High-priority known issue for the API hot path; `score_company()` itself is still sync for MCP/agent callers.)
+- `api/main.py:158` — `/health` now reports `"model": "llama-3.3-70b-versatile"` (was the stale `"claude-sonnet-4-6"` string left over from v1). `tests/test_api.py` assertion updated to match.
+- `CACHE_DAYS` reconciled to `28` (the Ritu 4-week rule) across `.env` and the `/score-company` docstring; code default was already `28`.
+
+### Planned
 - Phase D: Public endpoint (ngrok) + Clay Custom HTTP demo table + SignalOS Loom
 - Phase B: Multi-LLM cost breakdown — wire per-call costs from pre-filter, scoring, and opener into `model_costs` field on every run
 

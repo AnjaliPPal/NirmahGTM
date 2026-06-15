@@ -24,7 +24,7 @@ Your target account list
 POST /score-company
         │
         ▼
-Claude reasoning over 4 live signals
+Groq llama-3.3-70b reasoning over 5 live signals
   → score 1-10 + aha_moment + top_signal + contact window
   → if score ≥ 6: generate cold email opener
         │
@@ -34,11 +34,12 @@ Claude reasoning over 4 live signals
                       This is a total outbound rebuild. Window is NOW.
 ```
 
-**4 signals tracked:**
-- Raised funding in last 90 days
-- Actively hiring GTM/Sales roles
-- Headcount growth % last 6 months
-- Current tech stack
+**5 signals tracked:**
+- Leadership changes (new exec hires — VP Sales, CRO)
+- Hiring GTM/Sales roles
+- Tech stack (CRM + sales-engagement gaps)
+- Funding & M&A in last 90 days
+- Hidden intent (expansion/growth news before job posts appear)
 
 ---
 
@@ -53,7 +54,7 @@ python -m venv .venv
 
 pip install -r requirements.txt
 cp .env.example .env
-# Fill in ANTHROPIC_API_KEY, SLACK_WEBHOOK_URL, SUPABASE_URL, SUPABASE_KEY
+# Fill in GROQ_API_KEY (required); add SLACK + SUPABASE keys for full functionality
 
 uvicorn api.main:app --reload --port 8000
 ```
@@ -102,9 +103,9 @@ npx n8n
 
 | Item | Cost |
 |------|------|
-| AWS / hosting | ~$15/mo |
-| Claude API | ~$35/mo (at scale) |
-| **Total infra** | **~$50/mo** |
+| Hosting (ngrok/Railway free tier) | ~$0–15/mo |
+| LLM API (Groq free tier; optional OpenAI pre-filter) | ~$0–35/mo (at scale) |
+| **Total infra** | **~$15–50/mo** |
 | **Client price** | **$1,500/mo** |
 
 Comparable services charge $3K–$8K/month. Client owns the code.
@@ -114,12 +115,32 @@ Comparable services charge $3K–$8K/month. Client owns the code.
 ## Stack
 
 - **API:** FastAPI + uvicorn
-- **AI:** Claude Sonnet (reasoning, not rules)
-- **DB:** Supabase (Postgres)
+- **AI:** Groq llama-3.3-70b-versatile (free tier) + optional GPT-4o-mini pre-filter
+- **DB:** Supabase (Postgres + pgvector)
 - **Alerts:** Slack Incoming Webhooks
 - **Orchestration:** n8n (local, free)
 
 ---
+
+## Evals
+
+Two layers prove the scoring engine works:
+
+- **Offline** — a labeled golden set you can run in ~3 minutes, no live campaign needed:
+  ```bash
+  python evals/run_eval.py
+  ```
+  Prints band accuracy, high/low separation, top-signal agreement, and confidence
+  calibration, and exits non-zero if quality drops below `--min-accuracy` (a
+  regression gate). See [`evals/README.md`](evals/README.md). Sample scorecard:
+  ```
+  SignalOS Offline Eval - prompt v2.0 - 30 cases
+  Band accuracy:        100.0%  (30/30)
+  High/low separation:  PASS  (min high 7 vs max low 2)
+  Top-signal agreement: 75.0%  (3/4 labeled)
+  ```
+- **Online** — `/eval-report/{client_id}` tracks real reply/close rates by prompt
+  version from `/webhook/hubspot-reply` outcomes.
 
 ## Running Tests
 
