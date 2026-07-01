@@ -1,8 +1,8 @@
-# SignalOS
+# NirmahGTM
 
 **Know which of your 500 target accounts is ready to buy — right now.**
 
-SignalOS monitors target companies 24/7, detects when 3+ buying signals converge, and fires a Slack alert with a ready-to-send email opener. Your SDRs stop cold-calling everyone and start calling the 3 accounts that are actually in-market today.
+NirmahGTM monitors target companies 24/7, detects when 3+ buying signals converge, and fires a Slack alert with a ready-to-send email opener. Your SDRs stop cold-calling everyone and start calling the 3 accounts that are actually in-market today.
 
 ---
 
@@ -11,7 +11,7 @@ SignalOS monitors target companies 24/7, detects when 3+ buying signals converge
 B2B sales teams pay $3K–$8K/month for signal intelligence (Clay, Bombora, 6sense).
 Most still get 2% reply rates because their timing is wrong.
 
-SignalOS detects **when** to reach out — not just **who** to reach out to.
+NirmahGTM detects **when** to reach out — not just **who** to reach out to.
 
 ---
 
@@ -46,8 +46,8 @@ Groq llama-3.3-70b reasoning over 5 live signals
 ## Quickstart
 
 ```bash
-git clone https://github.com/yourusername/signalos
-cd signalos-v1
+git clone https://github.com/yourusername/NirmahGTM
+cd NirmahGTM-v1
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 # source .venv/bin/activate   # Mac/Linux
@@ -93,7 +93,7 @@ Run `db/schema.sql` once in your Supabase SQL editor.
 ```bash
 npx n8n
 # Open http://localhost:5678
-# Import n8n/signalos_workflow.json
+# Import n8n/NirmahGTM_workflow.json
 # Set schedule — runs every 2 hours automatically
 ```
 
@@ -134,7 +134,7 @@ Two layers prove the scoring engine works:
   calibration, and exits non-zero if quality drops below `--min-accuracy` (a
   regression gate). See [`evals/README.md`](evals/README.md). Sample scorecard:
   ```
-  SignalOS Offline Eval - prompt v2.0 - 30 cases
+  NirmahGTM Offline Eval - prompt v2.0 - 30 cases
   Band accuracy:        100.0%  (30/30)
   High/low separation:  PASS  (min high 7 vs max low 2)
   Top-signal agreement: 75.0%  (3/4 labeled)
